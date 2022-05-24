@@ -3,7 +3,7 @@ use redis;
 use redis::RedisResult;
 use humantime::format_duration;
 use std::time::Duration;
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{HashMap, hash_map::Entry, VecDeque};
 use std::sync::Arc;
 use std::thread;
 use std::env;
@@ -11,6 +11,8 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{bounded, Receiver};
 use std::fs;
 use std::io::Write;
+use serde::{Serialize, Deserialize};
+use bloomfilter::Bloom;
 
 const NUM_SAMPLES: usize = 1000;
 const NUM_WORKERS: usize = 20;
@@ -21,13 +23,29 @@ struct KeyStats {
     idletime: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BucketStats {
     name: String,
     size: u64,
     count: usize,
     min_idletime: u32,
     avg_idletime: u32,
+    examples: VecDeque<String>
+}
+
+impl BucketStats {
+    fn new(name: String, key_name: String, size: u64, idletime: u32) -> Self {
+        let mut buf = VecDeque::with_capacity(4);
+        buf.ringed_push(key_name);
+        BucketStats {
+            name,
+            size: size as u64,
+            count: 1,
+            avg_idletime: idletime,
+            min_idletime: idletime,
+            examples: buf
+        }
+    }
 }
 
 enum WorkMsg {
@@ -53,6 +71,18 @@ impl KeyStats {
     }
 }
 
+trait RingedBufferExt<T> {
+    fn ringed_push(&mut self, elem: T);
+}
+
+impl <T> RingedBufferExt<T> for VecDeque<T> {
+    fn ringed_push(&mut self, elem: T) {
+        if self.len() >= self.capacity() {
+            let _ = self.pop_back().unwrap();
+        }
+        self.push_front(elem);
+    }
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -65,6 +95,7 @@ fn main() {
 
 fn gather_data(redis_url: &str) -> HashMap<String, BucketStats> {
     let mut buckets: HashMap<String, BucketStats> = HashMap::new();
+    let mut bloom = Bloom::new_for_fp_rate(NUM_SAMPLES, 0.01);
 
     let client = Arc::new(redis::Client::open(redis_url).unwrap());
     let (workq, rcv) = bounded(NUM_WORKERS + NUM_SAMPLES);
@@ -100,8 +131,11 @@ fn gather_data(redis_url: &str) -> HashMap<String, BucketStats> {
 
     for _ in 0..NUM_SAMPLES {
         let msg = finished.recv().unwrap().unwrap();
-        add_to_bucket(&mut buckets, msg);
-        let _ = flush_send.try_send(FlushMsg::FLUSH(buckets.clone()));
+        if !bloom.check_and_set(&msg.name)
+        {
+            add_to_bucket(&mut buckets, msg);
+            let _ = flush_send.try_send(FlushMsg::FLUSH(buckets.clone()));
+        }
     }
 
     flush_send.send(FlushMsg::QUIT).unwrap();
@@ -133,16 +167,14 @@ fn add_to_bucket(buckets: &mut HashMap<String, BucketStats>, key_stats: KeyStats
             bucket_stats.size += key_stats.size as u64;
             bucket_stats.avg_idletime += key_stats.idletime.saturating_sub(bucket_stats.avg_idletime) / bucket_stats.count as u32;
             bucket_stats.min_idletime = min(key_stats.idletime, bucket_stats.min_idletime);
+            bucket_stats.examples.ringed_push(key_stats.name);
         }
         Entry::Vacant(vacant) => {
-            let name = vacant.key().to_owned();
-            vacant.insert(BucketStats {
+            let name = vacant.key().to_string();
+            vacant.insert(BucketStats::new(
                 name,
-                size: key_stats.size as u64,
-                count: 1,
-                avg_idletime: key_stats.idletime,
-                min_idletime: key_stats.idletime,
-            });
+                key_stats.name,
+                key_stats.size as u64, key_stats.idletime));
         }
     }
 }
@@ -154,6 +186,7 @@ fn write_to_file(f: &mut impl Write, buckets: &HashMap<String, BucketStats>) -> 
         writeln!(f, "Count: {}", bucket.count)?;
         writeln!(f, "Min Idle: {}", format_duration(Duration::new(bucket.min_idletime as u64, 0)))?;
         writeln!(f, "Avg Idle: {}", format_duration(Duration::new(bucket.avg_idletime as u64, 0)))?;
+        writeln!(f, "Example keys: {:?}", bucket.examples)?;
     }
     Ok(())
 }

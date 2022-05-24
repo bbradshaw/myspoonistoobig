@@ -9,3 +9,5 @@ edition = "2021"
 redis = "0.21.5"
 humantime = "2.1.0"
 crossbeam-channel = "0.5"
+serde = { version = "1.0.137", features = ["derive"]}
+bloomfilter = "1.0.9"
