@@ -14,8 +14,9 @@ use std::io::Write;
 use serde::{Serialize, Deserialize};
 use bloomfilter::Bloom;
 
-const NUM_SAMPLES: usize = 1000;
+const NUM_SAMPLES: usize = 8000;
 const NUM_WORKERS: usize = 20;
+const NUM_EXAMPLES: usize = 4;
 
 struct KeyStats {
     name: String,
@@ -35,7 +36,7 @@ struct BucketStats {
 
 impl BucketStats {
     fn new(name: String, key_name: String, size: u64, idletime: u32) -> Self {
-        let mut buf = VecDeque::with_capacity(4);
+        let mut buf = VecDeque::with_capacity(NUM_EXAMPLES);
         buf.ringed_push(key_name);
         BucketStats {
             name,
@@ -60,8 +61,10 @@ enum FlushMsg {
 
 impl KeyStats {
     fn get_stats(con: &mut redis::Connection, name: &str) -> RedisResult<Self> {
-        let size = redis::cmd("MEMORY").arg("USAGE").arg(name).query(con)?;
-        let idletime = redis::cmd("OBJECT").arg("IDLETIME").arg(name).query(con)?;
+        let (size, idletime) = redis::pipe()
+            .cmd("MEMORY").arg("USAGE").arg(name)
+            .cmd("OBJECT").arg("IDLETIME").arg(name)
+            .query(con)?;
         Ok(
             KeyStats {
                 name: name.to_owned(),
@@ -77,7 +80,7 @@ trait RingedBufferExt<T> {
 
 impl <T> RingedBufferExt<T> for VecDeque<T> {
     fn ringed_push(&mut self, elem: T) {
-        if self.len() >= self.capacity() {
+        if self.len() >= NUM_EXAMPLES {
             let _ = self.pop_back().unwrap();
         }
         self.push_front(elem);
@@ -90,7 +93,9 @@ fn main() {
 
     let buckets = gather_data(url);
     println!("\n\nDONE!!\n");
-    write_to_file(&mut std::io::stdout(), &buckets).unwrap();
+    let mut buckets: Vec<_> = buckets.into_values().collect();
+    buckets.sort_by_key(|b| b.size as i32 * -1);
+    buckets.iter().for_each(|b| write_to_file(&mut std::io::stdout(), b).unwrap());
 }
 
 fn gather_data(redis_url: &str) -> HashMap<String, BucketStats> {
@@ -179,15 +184,13 @@ fn add_to_bucket(buckets: &mut HashMap<String, BucketStats>, key_stats: KeyStats
     }
 }
 
-fn write_to_file(f: &mut impl Write, buckets: &HashMap<String, BucketStats>) -> Result<(), std::io::Error> {
-    for bucket in buckets.values() {
-        writeln!(f, "\nBucket: {}", &bucket.name)?;
-        writeln!(f, "Total Size: {}", bucket.size)?;
-        writeln!(f, "Count: {}", bucket.count)?;
-        writeln!(f, "Min Idle: {}", format_duration(Duration::new(bucket.min_idletime as u64, 0)))?;
-        writeln!(f, "Avg Idle: {}", format_duration(Duration::new(bucket.avg_idletime as u64, 0)))?;
-        writeln!(f, "Example keys: {:?}", bucket.examples)?;
-    }
+fn write_to_file(f: &mut impl Write, bucket: &BucketStats) -> Result<(), std::io::Error> {
+    writeln!(f, "\nBucket: {}", &bucket.name)?;
+    writeln!(f, "Total Size: {}", bucket.size)?;
+    writeln!(f, "Count: {}", bucket.count)?;
+    writeln!(f, "Min Idle: {}", format_duration(Duration::new(bucket.min_idletime as u64, 0)))?;
+    writeln!(f, "Avg Idle: {}", format_duration(Duration::new(bucket.avg_idletime as u64, 0)))?;
+    writeln!(f, "Example keys: {:?}", bucket.examples)?;
     Ok(())
 }
 
@@ -200,7 +203,7 @@ fn flush_work_thread(flushq: Receiver<FlushMsg>) -> JoinHandle<()>{
                     FlushMsg::QUIT => break,
                     FlushMsg::FLUSH(buckets) => {
                         println!("Flushing state with {} keys counted", buckets.values().fold(0usize, |acc, b| acc + b.count));
-                        write_to_file(&mut state_file, &buckets).expect("Error writing to state file!");
+                        buckets.values().for_each(|b| write_to_file(&mut state_file, b).expect("Error writing to state file!"));
                     }
                 }
             }
